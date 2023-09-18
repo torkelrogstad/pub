@@ -6,6 +6,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -13,11 +15,14 @@ import (
 
 	"cloud.google.com/go/pubsub"
 	"google.golang.org/api/iterator"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
 	projectID  = flag.String("project", "", "Google project ID (defaults to gcloud settings)")
 	listTopics = flag.Bool("list", false, "list available topics")
+	verbose    = flag.Bool("v", false, "verbose output")
 )
 
 func main() {
@@ -28,6 +33,11 @@ func main() {
 }
 
 func getProject(ctx context.Context) (string, error) {
+	log.SetFlags(log.Lmicroseconds)
+	if !*verbose {
+		log.SetOutput(io.Discard)
+	}
+
 	if *projectID != "" {
 		return *projectID, nil
 	}
@@ -54,6 +64,11 @@ func doListTopics(ctx context.Context, client *pubsub.Client) error {
 }
 
 func realMain() error {
+	flag.Usage = func() {
+		fmt.Println()
+		fmt.Fprintf(flag.CommandLine.Output(), "Usage of %s: <topic> <base64_data>\n", os.Args[0])
+
+	}
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -63,6 +78,7 @@ func realMain() error {
 	if err != nil {
 		return err
 	}
+	log.Printf("project: %s", project)
 
 	client, err := pubsub.NewClient(ctx, project)
 	if err != nil {
@@ -93,12 +109,28 @@ func realMain() error {
 	}
 
 	t := client.Topic(topic)
+	if strings.Contains(topic, "/") {
+		log.Printf("assuming topic is full path: %s", topic)
+		parts := strings.Split(topic, "/")
+		if len(parts) != 4 {
+			return fmt.Errorf("invalid format: expects projects/PROJECT_ID/topics/NAME: %w", err)
+		}
+
+		project := parts[1]
+		topic := parts[3]
+		t = client.TopicInProject(topic, project)
+	}
+
 	res := t.Publish(ctx, &pubsub.Message{
 		Data: data,
 	})
 
 	serverID, err := res.Get(ctx)
-	if err != nil {
+	switch {
+	case status.Code(err) == codes.NotFound:
+		return fmt.Errorf("publish: topic not found: %s", t.ID())
+
+	case err != nil:
 		return fmt.Errorf("publish: %w", err)
 	}
 
