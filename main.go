@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"errors"
@@ -12,11 +13,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"time"
 
 	"cloud.google.com/go/pubsub"
+	"github.com/samber/lo"
+	"github.com/sourcegraph/conc/pool"
 	"google.golang.org/api/iterator"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 var (
@@ -99,15 +101,6 @@ func realMain() error {
 		return errors.New("expects data as second argument")
 	}
 
-	// First try to decode the given data. If it's valid base64, we assume
-	// that we should send the decoded content of that string, not the string
-	// itself.
-	data, err := base64.StdEncoding.DecodeString(strData)
-	if err != nil {
-		// Fall back to the string
-		data = []byte(strData)
-	}
-
 	t := client.Topic(topic)
 	if strings.Contains(topic, "/") {
 		log.Printf("assuming topic is full path: %s", topic)
@@ -121,19 +114,101 @@ func realMain() error {
 		t = client.TopicInProject(topic, project)
 	}
 
-	res := t.Publish(ctx, &pubsub.Message{
-		Data: data,
-	})
-
-	serverID, err := res.Get(ctx)
-	switch {
-	case status.Code(err) == codes.NotFound:
-		return fmt.Errorf("publish: topic not found: %s", t.ID())
-
-	case err != nil:
-		return fmt.Errorf("publish: %w", err)
+	exists, err := t.Exists(ctx)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("topic not found: %s", t.String())
 	}
 
-	fmt.Printf("published %d bytes to %s: server ID %s\n", len(data), t.String(), serverID)
+	msgs, err := getData(strData)
+	if err != nil {
+		return err
+	}
+
+	if len(msgs) == 0 {
+		return errors.New("no data to publish")
+	}
+
+	if len(msgs) > 1 {
+		log.Printf("publishing %d messages", len(msgs))
+	}
+
+	if duplicates := lo.FindDuplicatesBy(msgs, func(msg []byte) string {
+		return string(msg)
+	}); len(duplicates) > 0 {
+		return fmt.Errorf("duplicates found: %v", duplicates)
+	}
+
+	start := time.Now()
+	p := pool.New().WithContext(ctx)
+
+	var bytes int
+	for idx, msg := range msgs {
+		bytes += len(msg)
+		idx := idx
+		msg := msg
+
+		p.Go(func(ctx context.Context) error {
+			msg := &pubsub.Message{
+				Data: msg,
+			}
+			id, err := t.Publish(ctx, msg).Get(ctx)
+			if err != nil {
+				return fmt.Errorf("publish msg %d: %w", idx, err)
+			}
+			log.Printf("published msg %d: %s", idx, id)
+			return nil
+		})
+	}
+
+	if err := p.Wait(); err != nil {
+		return err
+	}
+
+	fmt.Printf(
+		"published %d bytes across %d message(s) to %s in %s\n",
+		bytes, len(msgs), t.String(), time.Since(start),
+	)
 	return nil
+}
+
+func getData(strData string) ([][]byte, error) {
+	if strData == "-" {
+		log.Printf("reading data from stdin")
+
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return nil, err
+		}
+
+		lines := bytes.Split(data, []byte("\n"))
+
+		var out [][]byte
+		for idx, line := range lines {
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) == 0 {
+				continue
+			}
+
+			data, err := base64.StdEncoding.DecodeString(string(trimmed))
+			if err != nil {
+				return nil, fmt.Errorf("decode line %d: %w", idx, err)
+			}
+			out = append(out, data)
+		}
+		return out, nil
+	}
+
+	// First try to decode the given data. If it's valid base64, we assume
+	// that we should send the decoded content of that string, not the string
+	// itself.
+	data, err := base64.StdEncoding.DecodeString(strData)
+	if err != nil {
+		// Fall back to the string
+		data = []byte(strData)
+	}
+
+	return [][]byte{data}, nil
 }
